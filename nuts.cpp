@@ -102,11 +102,11 @@ pq_struct leapfrog(arma::vec q, arma::vec p, float epsilon,
 
 Tree BuildTree(arma::vec& q, arma::vec& p, float logu, int v, int j, float epsilon,
                const arma::ivec& v_n, const arma::mat& W, const arma::rowvec& norms_W, 
-               float alpha, float beta){
+               float alpha, float beta, std::default_random_engine& generator){
   int ntabs = 5-j;
   std::cout << std::string(ntabs, '\t') << "TREE j= " << j << std::endl;
 
-  std::default_random_engine generator;
+  //std::default_random_engine generator;
   std::uniform_real_distribution<double> unif01(0.0,1.0);
   int K = W.n_cols;
   int F = W.n_rows;
@@ -126,19 +126,24 @@ Tree BuildTree(arma::vec& q, arma::vec& p, float logu, int v, int j, float epsil
   
   float delta_max = 1000; // Recommended in the NUTS paper: 1000
   
-  if(j==0){
+  if(j == 0){
     std::cout << std::string(ntabs, '\t') << "Leapfrog-----------------" << std::endl;
     std::cout << std::string(ntabs, '\t') << "Leapfrog init:" << q.t();
 
-    // Base case - take one leapfrog step in the direction v
-    // Metropolis accept-reject will be done in the main function
+    // Base case - take a single leapfrog step in the direction v
     pq_struct pq = leapfrog(q, p, v*epsilon, v_n, W, norms_W, alpha, beta);
-    q_prima = pq.q;
+    q_prima = pq.q; 
     p_prima = pq.p;
-    float joint = loglike_cpp(q_prima, v_n, W, alpha, beta) - 0.5 * sum(p_prima % p_prima); 
+	float joint = loglike_cpp(q_prima, v_n, W, alpha, beta) - 0.5 * sum(p_prima % p_prima); 
+ 	
+ 	// Is the new point in the slice?
     int n_prima   = (logu <= joint);
+
+    // Is the simulation wildly inaccurate?
     int s_prima   = joint - logu > - delta_max;
-    //std::cout << "s_prima criteria in leapfrof: " << s_prima << std::endl;
+
+    // Set the return values 
+    // minus=plus for all things here, since the tree is of depth 0.
     tree.minus_q = q_prima;
     tree.minus_p = p_prima;
     tree.plus_q  = q_prima;
@@ -146,15 +151,20 @@ Tree BuildTree(arma::vec& q, arma::vec& p, float logu, int v, int j, float epsil
     tree.q_prima = q_prima;
     tree.n = n_prima;
     tree.s = s_prima;
+
     std::cout << std::string(ntabs, '\t') << "Leapfrog end :" << tree.q_prima.t();
+    std::cout << std::string(ntabs, '\t') << "Leapfrog in the slice? ok: 1, ko: 0 :" << n_prima << std::endl;
+    std::cout << std::string(ntabs, '\t') << "Simulation wildly inacurate? ok: 1, ko: 0 :" << s_prima << std::endl;
+    
     return tree;
     
   } else {
     std::cout << std::string(ntabs, '\t') << "Recursion-----------------" << std::endl;
     std::cout << std::string(ntabs, '\t') << "implicitly build the left and right subtrees-" << std::endl;
-    std::cout << std::string(ntabs, '\t')  << q.t() << std::endl;
+    
+    std::cout << std::string(ntabs, '\t')  << "from q: " << q.t() << std::endl;
     // Recursion -- implicitly build the left and right subtrees
-    Tree tree = BuildTree(q, p, logu, v, j-1, epsilon, v_n, W, norms_W, alpha, beta);
+    Tree tree = BuildTree(q, p, logu, v, j-1, epsilon, v_n, W, norms_W, alpha, beta, generator);
     minus_q = tree.minus_q;
     minus_p = tree.minus_p;
     plus_q  = tree.plus_q;
@@ -169,17 +179,16 @@ Tree BuildTree(arma::vec& q, arma::vec& p, float logu, int v, int j, float epsil
 
        // Double the size of the tree.
       if(v == -1){
-        std::cout << std::string(ntabs, '\t')  << "Build to left:"  << minus_q.t();
-        tree = BuildTree(minus_q, minus_p, logu, v, j-1, epsilon, v_n, W, norms_W, alpha, beta);
+        std::cout << std::string(ntabs, '\t')  << "Double to the left from q-: "  << minus_q.t();
+        Tree tree = BuildTree(minus_q, minus_p, logu, v, j-1, epsilon, v_n, W, norms_W, alpha, beta, generator);
         minus_q  = tree.minus_q;
         minus_p  = tree.minus_p;
         q_prima2 = tree.q_prima;
         n_prima2 = tree.n;
         s_prima2 = tree.s;
-        std::cout << std::string(ntabs, '\t')  << "Build tolllll55555555555llll left:"  << minus_q.t();
       } else {
-        std::cout << std::string(ntabs, '\t')  << "Build to right:"  << plus_q.t();
-        tree  = BuildTree(plus_q, plus_p, logu, v, j-1, epsilon, v_n, W, norms_W, alpha, beta);
+        std::cout << std::string(ntabs, '\t')  << "Double to the right from q+:"  << plus_q.t();
+        Tree tree  = BuildTree(plus_q, plus_p, logu, v, j-1, epsilon, v_n, W, norms_W, alpha, beta, generator);
         plus_q   = tree.plus_q;
         plus_p   = tree.plus_p;
         q_prima2 = tree.q_prima;
@@ -187,14 +196,16 @@ Tree BuildTree(arma::vec& q, arma::vec& p, float logu, int v, int j, float epsil
         s_prima2 = tree.s;
       }
 
-
-      std::cout << std::string(ntabs, '\t')  << n_prima2 << "/" << n_prima << "YEYA Build tolllll55555555555llll lesssssft:"  << minus_q.t();
-      float prob = n_prima2/(n_prima + n_prima2);
-      std::cout << std::string(ntabs, '\t')  << "FLOAT:"  << prob;
-      if(unif01(generator) < prob){
-        std::cout << std::string(ntabs, '\t')  << "Build tolllll55sssft:"  << minus_q.t();
-        q_prima = q_prima2; 
-      }
+      // Choose which subtree to propagate a sample up from.
+      float prob = static_cast<float>(n_prima2) / std::max((n_prima + n_prima2), 1); // avoids 0/0;
+      float rand01 = unif01(generator);
+      std::cout << '\n' << std::string(ntabs, '\t')  << "Choose subtree to propagate a sample up from. Probs:" << rand01 << "/" << prob << std::endl;
+      if(rand01 < prob){
+        q_prima = q_prima2;
+        std::cout << std::string(ntabs, '\t')  << "Chose qprima2" << std::endl;
+      } else{
+      	std::cout << std::string(ntabs, '\t')  << "Chose qprima" << std::endl;
+  	  }	
 
       arma::vec diff_q = (plus_q - minus_q);
       int uturn = (sum(diff_q % minus_p) >= 0) && (sum(diff_q % plus_p) >= 0);
@@ -255,10 +266,10 @@ arma::mat sample_nuts_cpp(const arma::ivec v_n, const arma::mat& W, arma::vec h_
     for(int k=0; k<K; k++){
       p0[k] = normal(generator);
     }
-    std::cout << "Momentum: " << p.t() << std::endl;
+    std::cout << "Momentum p0: " << p0.t() << std::endl;
 
     // Joint logprobability of position q and momentum p
-    float joint = loglike_cpp(current_q, v_n, W, alpha, beta) - 0.5* sum(p % p);
+    float joint = loglike_cpp(current_q, v_n, W, alpha, beta) - 0.5* sum(p0 % p0);
 
     // Resample u ~ uniform([0, exp(joint)]). 
     // double limit_sup = exp( loglike_cpp(current_q, v_n, W, alpha, beta) - 0.5* sum(p % p));
@@ -286,7 +297,7 @@ arma::mat sample_nuts_cpp(const arma::ivec v_n, const arma::mat& W, arma::vec h_
     
     // While no U-turn
     while(s==1){
-      std::cout << "~~~~~~~~Depth: " << j << "(will open 2^j trees)" << j << std::endl;
+      std::cout << "\n~~~~~~~~Depth: " << j << "(will open 2^j trees): " << j << std::endl;
 
       Tree tree;  
       int n_prima;
@@ -299,18 +310,18 @@ arma::mat sample_nuts_cpp(const arma::ivec v_n, const arma::mat& W, arma::vec h_
       std::cout << "q+:" << plus_q.t();
       std::cout << "q-:" << minus_q.t();
 
-      std::cout << "Main direction of the trees:" << v << std::endl;
+      std::cout << "New chosen direction:" << v << std::endl;
       
       // Double the size of the tree
       if(v == -1){    // if backwards
         tree = BuildTree(minus_q, minus_p, logu, v, j, epsilon, v_n, W, norms_W, 
-                               alpha, beta);
+                               alpha, beta, generator);
         minus_q = tree.minus_q;
         minus_p = tree.minus_p;
         
       } else {       // if forwards
         tree = BuildTree(plus_q,   plus_p, logu, v, j, epsilon, v_n, W, norms_W, 
-                              alpha, beta);
+                              alpha, beta, generator);
         plus_q  = tree.plus_q;
         plus_p  = tree.plus_p;
       }
@@ -321,21 +332,20 @@ arma::mat sample_nuts_cpp(const arma::ivec v_n, const arma::mat& W, arma::vec h_
       std::cout << "End of trees at level j" << std::endl;
       std::cout << "q+:" << plus_q.t();
       std::cout << "q-:" << minus_q.t();
-      std::cout << "n':" << n_prima << std::endl;
-      std::cout << "candidate s':" << s_prima << std::endl;
-      std::cout << "q':" << q_prima.t() << std::endl;
+      std::cout << "n' (valid points in subtrees at level j):" << n_prima << std::endl;
+      std::cout << "s' (stop criteria met in subtrees at level j):" << s_prima << std::endl;
+      std::cout << "q':" << q_prima.t();
     
       
       if(s_prima == 1){ 
         // Use Metropolis-Hastings to decide whether or not to move to a
         // point from the half-tree we just generated.
-        std::cout << "prob accepted = n'/n = " << n_prima/n;
+        std::cout << "prob q' accepted = n'/n = " << n_prima/n;
         if(unif01(generator) < std::min(1, n_prima/n)){ 
           current_q = q_prima; // Accept proposal (it will be THE new sample when s=0)
-          std::cout << "Accepted: " << q_prima.t() << std::endl;
-
+          std::cout << "--Accepted:" << std::endl;
         } else {
-          std::cout << "Rejected: " << q_prima.t() << std::endl;
+          std::cout << "--Rejected: " << std::endl;
         }
       }
 
@@ -389,8 +399,8 @@ int main(){
   //std::cout << W << std::endl;
 
 
-  float epsilon = 0.01;
-  int iter = 10;
+  float epsilon = 0.00001;
+  int iter = 3;
   arma::mat samples = sample_nuts_cpp(v_n, W, h_n+10, alpha, beta, epsilon, iter);
 
   std::cout << "samples of h_n:" << std::endl;
