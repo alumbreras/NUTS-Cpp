@@ -5,272 +5,202 @@
 #include <numeric>
 using namespace arma;
 
-// Stores position q and momentum p
-struct pq_struct {
+// Position q and momentum p
+struct pq_point {
   arma::vec q;
   arma::vec p;
+  pq_point(k) {q(k); p(k);};
 };
 
-// Stores position-momentum of forward and backwards path
-struct Tree {
-  arma::vec minus_q;
-  arma::vec plus_q;
-  arma::vec minus_p;
-  arma::vec plus_p;
-  arma::vec q_prima;
-  int n;
-  int s;
+struct nuts_util {
+  // Constants through each recursion
+  double log_u; // uniform sample
+  double H0; 	// Hamiltonian of starting point?
+  int sign; 	// direction of the tree in a given iteration/recursion
+
+  // Aggregators through each recursion
+  int n_tree;
+  double sum_prob; 
+  bool criterion;
+
+  // just to guarantee bool initializes to valid value
+  nuts_util() : criterion(false) { }
 };
 
 
-// Gamma-Poisson posterior
-float posterior_h_cpp(const arma::vec& h_n, const arma::ivec& v_n, const arma::mat& W, 
-                      float alpha, float beta){
-  
-  float logp = 0;
-  
-  if(any(h_n < 0)){
-    return - arma::datum::inf;
-  }
-  
-  int K = W.n_cols;
-  int F = W.n_rows;
-  
-  arma::vec lambdas = W * h_n;
-  
-  for(int f = 0; f < F; f++){
-    logp += v_n[f] * log(lambdas[f]) - lambdas[f]; //- log(std::tgamma(v_n[f]+1));  
-  }
-  for(int k = 0; k < K; k++){
-    logp += (alpha-1)*log(h_n[k]) - beta*h_n[k];
-  }
-  
-  // Similar alternative:
-  //logp = sum(v_n % log(lambdas)) - beta*sum(lambdas) + 
-  //        sum((alpha-1)*log(h_n) - beta*h_n);
-  
+struct posterior_params {
+ 	arma::vec v_n;
+ 	arma::mat W;
+ 	arma::mat norms_W;  
+ 	double alpha;
+ 	double beta;
+}
+
+
+
+// Gamma-Poisson log posterior
+double posterior_eta_cpp(const arma::vec& eta_n, const arma::ivec& v_n, const arma::mat& W, 
+                        float alpha, float beta){
+  arma::vec exp_eta = exp(eta_n);
+  double logp = posterior_h_cpp(exp_eta, v_n, W, alpha, beta) + sum(eta_n);
   return logp;
 }
+
 
 // Posterior wrapper
 double loglike_cpp(const arma::vec& h_n, const arma::ivec& v_n, const arma::mat& W, 
              float alpha, float beta){
-  return posterior_h_cpp(h_n, v_n, W, alpha, beta);
+  return posterior_h_cpp(h_n, 
+  						posterior_params -> v_n, 
+  						posterior_params -> W, 
+  						posterior_params -> alpha, 
+  						posterior_params -> beta);
 }
 
 // Gradient of the log posterior
-arma::vec grad_loglike_cpp(const arma::vec& h_n, const arma::ivec& v_n, 
-                           const arma::mat& W, const arma::rowvec& norms_W,
-                           float alpha, float beta){
+arma::vec grad_loglike_cpp(const arma::vec& eta_n, const arma::ivec& v_n, 
+                                 const arma::mat& W, const arma::rowvec& norms_W,
+                                 float alpha, float beta){
   
-  int K = h_n.size();  
+  int K = eta_n.size();  
   arma::vec dh = zeros(K);
-  arma::vec lambdas = W * h_n; // this is the slowest bottleneck
+  arma::vec lambdas = W * exp(eta_n);
   for(int k=0; k < K; k++){
-    dh[k] = (alpha-1)/h_n[k] - (beta + norms_W[k]) + sum(v_n % (W.col(k)/lambdas));
+    dh[k] = alpha - exp(eta_n[k])*(beta + norms_W[k]) + sum(v_n % (W.col(k)*exp(eta_n[k])/lambdas));
   }
   return dh;
 }
 
 
 // Performs one leapfrom step (NUTS paper, Algorithm 1)
-pq_struct leapfrog(arma::vec q, arma::vec p, float epsilon, 
-                   const arma::ivec &v_n, const arma::mat& W, const arma::rowvec& norms_W, 
-                   float alpha, float beta){
+void leapfrog(pq_point &z, float epsilon, posterior_params& postparams){
   
-  pq_struct pq;
-  //std::cout << "* Leapfrog init" << std::endl;
-  //std::cout << "q: " << q.t() << std::endl;
-  //std::cout << "p: " << p.t() << std::endl;
-  //std::cout << "grad" << p + epsilon * 0.5 * grad_loglike_cpp(q, v_n, W, norms_W, alpha=alpha, beta=beta) << endl;
-  p += epsilon * 0.5 * grad_loglike_cpp(q, v_n, W, norms_W, alpha=alpha, beta=beta);
-  //std::cout << "p_: " << p.t() << std::endl;
-  q += epsilon * p;
-  //std::cout << "q_: " << q.t() << std::endl;
-  q  = abs(q); // Bouncing. Recommended by Nico (to stay in non-negative values)
-  //std::cout << "q_: " << q.t() << std::endl;
-  p += epsilon * 0.5 * grad_loglike_cpp(q, v_n, W, norms_W, alpha=alpha, beta=beta);
-  //std::cout << "p_: " << p.t() << std::endl;
-
-  pq.q = q; 
-  pq.p = p;
-  //std::cout << "* Leapfrog end" << std::endl;
-  //std::cout << q.t() << std::endl;
-  
-  return pq;
+  z -> p += epsilon * 0.5 * grad_loglike_cpp(z -> q, 
+  										posterior_params -> v_n, 
+  										posterior_params -> W, 
+  										posterior_params -> norms_W, 
+  										alpha = posterior_params->alpha, 
+  										beta = posterior_params -> beta);
+  z -> q += epsilon * z-> p;
+  z -> p += epsilon * 0.5 * grad_loglike_cpp(z -> q,									
+  										posterior_params -> v_n, 
+  										posterior_params->W, 
+  										posterior_params -> norms_W, 
+  										alpha = posterior_params->alpha, 
+  										beta = posterior_params -> beta);
 }
 
-Tree BuildTree(arma::vec& q, arma::vec& p, float logu, int v, int j, float epsilon,
-               const arma::ivec& v_n, const arma::mat& W, const arma::rowvec& norms_W, 
-               float alpha, float beta, std::default_random_engine& generator){
-  int ntabs = 5-j;
-  std::cout << std::string(ntabs, '\t') << "TREE j= " << j << std::endl;
+//////////////////////////////////////////////////////////////////////////////
+//////////////////////////////////////////////////////////////////////////////
+int BuildTree(pq_point* z, ps_point* z_init_parent, pq_point& z_propose, nuts_util util, int depth, float epsilon,
+              posterior_params& postparams, 
+              std::default_random_engine& generator){
+
+  int ntabs = std::max(1, 5-depth);
 
   //std::default_random_engine generator;
   std::uniform_real_distribution<double> unif01(0.0,1.0);
   int K = W.n_cols;
-  int F = W.n_rows;
-
-  Tree tree;
-  arma::vec q_prima(F);
-  arma::vec p_prima(F);
-  arma::vec minus_q(F);
-  arma::vec minus_p(F);
-  arma::vec plus_q(F);
-  arma::vec plus_p(F);
-  int n_prima;
-  int s_prima;
-  arma::vec q_prima2(F);
-  int n_prima2;
-  int s_prima2;
-  
+  int F = W.n_rows;  
   float delta_max = 1000; // Recommended in the NUTS paper: 1000
   
-  if(j == 0){
-    std::cout << std::string(ntabs, '\t') << "Leapfrog-----------------" << std::endl;
-    std::cout << std::string(ntabs, '\t') << "Leapfrog init:" << q.t();
-
+  if(depth == 0){
     // Base case - take a single leapfrog step in the direction v
-    pq_struct pq = leapfrog(q, p, v*epsilon, v_n, W, norms_W, alpha, beta);
-    q_prima = pq.q; 
-    p_prima = pq.p;
-	float joint = loglike_cpp(q_prima, v_n, W, alpha, beta) - 0.5 * sum(p_prima % p_prima); 
- 	
- 	// Is the new point in the slice?
-    int n_prima   = (logu <= joint);
+    leapfrog(z_propose, v*epsilon, postparams);
 
-    // Is the simulation wildly inaccurate?
-    int s_prima   = joint - logu > - delta_max;
+    // If called from a left tree, it modifies also plus and minus. (the other extreme, z_init)
+    // Else, only plus or minus
+    if (z_init_parent) *z_init_parent = z;
 
-    // Set the return values 
-    // minus=plus for all things here, since the tree is of depth 0.
-    tree.minus_q = q_prima;
-    tree.minus_p = p_prima;
-    tree.plus_q  = q_prima;
-    tree.plus_p  = p_prima;
-    tree.q_prima = q_prima;
-    tree.n = n_prima;
-    tree.s = s_prima;
+	float joint = loglike_cpp(z_propose->q, postparams) - 0.5 * sum(z_propose->p % z_propose->p); 
+    int n_valid_subtree   = (logu <= joint);  	// Is the new point in the slice?
+    util.criterion = logu - joint < delta_max; // Is the simulation wildly inaccurate?
+	util.n_tree += 1;
+    return n_valid_subtree;
 
-    std::cout << std::string(ntabs, '\t') << "Leapfrog end :" << tree.q_prima.t();
-    std::cout << std::string(ntabs, '\t') << "Leapfrog in the slice? ok: 1, ko: 0 :" << n_prima << std::endl;
-    std::cout << std::string(ntabs, '\t') << "Simulation wildly inacurate? ok: 1, ko: 0 :" << s_prima << std::endl;
-    
-    return tree;
-    
   } else {
-    std::cout << std::string(ntabs, '\t') << "Recursion-----------------" << std::endl;
-    std::cout << std::string(ntabs, '\t') << "implicitly build the left and right subtrees-" << std::endl;
-    
-    std::cout << std::string(ntabs, '\t')  << "from q: " << q.t() << std::endl;
     // Recursion -- implicitly build the left and right subtrees
-    Tree tree = BuildTree(q, p, logu, v, j-1, epsilon, v_n, W, norms_W, alpha, beta, generator);
-    minus_q = tree.minus_q;
-    minus_p = tree.minus_p;
-    plus_q  = tree.plus_q;
-    plus_p  = tree.plus_p;
-    q_prima = tree.q_prima;
-    n_prima = tree.n;
-    s_prima = tree.s;
-    std::cout << std::string(ntabs, '\t')  << "Left:"  << minus_q.t();
-    std::cout << std::string(ntabs, '\t')  << "Right:" << plus_q.t();
-    std::cout << std::string(ntabs, '\t')  << "s_prima:" << s_prima << std::endl;
-    if(s_prima == 1){
 
-       // Double the size of the tree.
-      if(v == -1){
-        std::cout << std::string(ntabs, '\t')  << "Double to the left from q-: "  << minus_q.t();
-        Tree tree = BuildTree(minus_q, minus_p, logu, v, j-1, epsilon, v_n, W, norms_W, alpha, beta, generator);
-        minus_q  = tree.minus_q;
-        minus_p  = tree.minus_p;
-        q_prima2 = tree.q_prima;
-        n_prima2 = tree.n;
-        s_prima2 = tree.s;
-      } else {
-        std::cout << std::string(ntabs, '\t')  << "Double to the right from q+:"  << plus_q.t();
-        Tree tree  = BuildTree(plus_q, plus_p, logu, v, j-1, epsilon, v_n, W, norms_W, alpha, beta, generator);
-        plus_q   = tree.plus_q;
-        plus_p   = tree.plus_p;
-        q_prima2 = tree.q_prima;
-        n_prima2 = tree.n;
-        s_prima2 = tree.s;
-      }
+    // Left subtree
+    n1 = BuildTree(&z, &z_init, z_propose, util, depth-1, epsilon, postparams, generator);
+    if (!util.criterion) return 0; // early stopping
 
-      // Choose which subtree to propagate a sample up from.
-      float prob = static_cast<float>(n_prima2) / std::max((n_prima + n_prima2), 1); // avoids 0/0;
-      float rand01 = unif01(generator);
-      std::cout << '\n' << std::string(ntabs, '\t')  << "Choose subtree to propagate a sample up from. Probs:" << rand01 << "/" << prob << std::endl;
-      if(rand01 < prob){
-        q_prima = q_prima2;
-        std::cout << std::string(ntabs, '\t')  << "Chose qprima2" << std::endl;
-      } else{
-      	std::cout << std::string(ntabs, '\t')  << "Chose qprima" << std::endl;
-  	  }	
+	// Right subtree
+    pq_point z_propose_2;
+	z_propose_right->q = z_propose->q;
+	z_propose_right->p = z_propose->p;
+	n2 = BuildTree(z*, z_propose_right, logu, depth-1, epsilon, postparams, generator);
 
-      arma::vec diff_q = (plus_q - minus_q);
-      int uturn = (sum(diff_q % minus_p) >= 0) && (sum(diff_q % plus_p) >= 0);
-      s_prima  =  s_prima2 * uturn; // stop if large error or U-turn
-      n_prima +=  n_prima2; // Update the number of valid points. 
-    }
-    std::cout << std::string(ntabs, '\t')  << "Right-Left trees built";
+	// Choose which subtree to propagate a sample up from.
+	//double accept_prob = static_cast<double>(n_prima2) / std::max((n_prima + n_prima2), 1); // avoids 0/0;
+	double accept_prob = static_cast<double>(n2) / static_cast<double>(n1 + n2);
+	float rand01 = unif01(generator);
+	if(util.criterion && (rand01 < accept_prob)){
+	z_propose = z_propose_right;
+	}
+
+	arma::vec diff_q = (z_plus->q - z_minus->q); //z_init - z
+	int uturn = (sum(diff_q % minus_p) >= 0) && (sum(diff_q % plus_p) >= 0);
+	util.criterion  =  criterion * uturn; // stop if large error or U-turn
+
     
-    tree.minus_q = minus_q;
-    tree.minus_p = minus_p;
-    tree.plus_q  = plus_q;
-    tree.plus_p  = plus_p;
-    tree.q_prima = q_prima;
-    tree.n = n_prima;
-    tree.s = s_prima;
-    return tree;
+    return n1 + n2;
   }
 }
 
-arma::mat sample_nuts_cpp(const arma::ivec v_n, const arma::mat& W, arma::vec h_n_current,
+arma::mat sample_nuts_cpp(const arma::ivec v_n, const arma::mat& W, arma::vec current_q,
                           double alpha = 1, double beta = 1,
                           float epsilon = 0.01,
                           int iter=100){
   
   int K = W.n_cols;
   int F = W.n_rows;
+  int MAXDEPTH = 3;
   
   std::default_random_engine generator;
   std::uniform_real_distribution<double> unif01(0.0,1.0);
   std::normal_distribution<double> normal(0,1);
 
-
-  // Pre-compute column norms
+  //const arma::rowvec norms_W = u_ * W;  
+  // Store fixed data and parameters
+  posterior_params postparams;
   const arma::rowvec u_(F);
-  const arma::rowvec norms_W = u_ * W;
-  
+  postparams.W 	 	 = W;
+  postparams.v_n 	 = v_n;
+  postparams.norms_W = u_ * W;
+  postparams.alpha 	 = alpha;
+  postparams.beta 	 = beta;
+
   arma::mat h_n_samples(K, iter);   // traces of p
-  arma::vec q(K);                   // position
-  arma::vec current_q(K);
   arma::vec p0(K);                  // initial momentum
-  //arma::vec current_p(K);
-  arma::vec minus_q(K);
-  arma::vec minus_p(K);
-  arma::vec plus_q(K);
-  arma::vec plus_p(K);
-  arma::vec q_prima(K);
-  current_q = h_n_current;
-  h_n_samples.col(1) = h_n_current;
+  arma::vec current_q(K);			// position
 
-
+  current_q = log(current_q); 		// Transform to unrestricted space
+  h_n_samples.col(1) = current_q;
+  
+  pq_point z_propose;
+  pq_point z;
+  pq_point z_plus;
+  pq_point z_minus;
+  
+  arma::vec rho;
+  arma::vec rho_plus;
+  arma::vec rho_minus;
 
   for(int i=2; i<iter; i++){
-    std::cout << "************************************************************" << i << std::endl;
-    std::cout << "************************************************************" << std::endl;
-    std::cout << "Sample: " << i << std::endl;
+    std::cout << " ************************ Sample: " << i << std::endl;
+
+    nuts_util util;
 
     // Sample new momentum (K independent standard normal variates)
     for(int k=0; k<K; k++){
       p0[k] = normal(generator);
     }
-    std::cout << "Momentum p0: " << p0.t() << std::endl;
 
     // Joint logprobability of position q and momentum p
-    float joint = loglike_cpp(current_q, v_n, W, alpha, beta) - 0.5* sum(p0 % p0);
+    float joint = loglike_cpp(current_q, postparams) - 0.5* sum(p0 % p0);
 
+    // Sample the slice variable
     // Resample u ~ uniform([0, exp(joint)]). 
     // double limit_sup = exp( loglike_cpp(current_q, v_n, W, alpha, beta) - 0.5* sum(p % p));
     // std::uniform_real_distribution<double> distribution(0.0,limit_sup); Computational issues
@@ -285,79 +215,63 @@ arma::mat sample_nuts_cpp(const arma::ivec v_n, const arma::mat& W, arma::vec h_
     // current_q = samples_q(m-1); 
 
     // Initialize the tree
-    minus_q = current_q;  // position in the backward path
-    plus_q = current_q;   // position in the forward path
-    minus_p = p0;          // momentum in the backward path
-    plus_p = p0;           // momentum in the forward path
-        
+    z_propose -> q = current_q;
+    z_propose -> p = p0;
+    z_minus -> q = current_q;   // position and momentum in the backward path
+    z_minus -> p = p0;		    
+    z_plus  -> q = current_q;          // momentum in the backward path
+    z_plus  -> p = p0;          // momentum in the forward path
+
     int j = 0;            // Initial heigth j = 0
-    int n = 1;            // Initially the only valid point is the initial point
-    int s = 1;            // Main loop: will keep going until stop criterion s == 0.
+    int n = 1;			  
     
-    
+    // Build a balanced binary tree until the NUTS criterion fails
+    util.criterion = true;
+    int n_valid = 0; // Initially the only valid point is the initial point
+    int depth_ = 0
+    int divergent_ = 0
+
+    util.n_tree = 0;
+    util.sum_prob = 0;
+
     // While no U-turn
-    while(s==1){
-      std::cout << "\n~~~~~~~~Depth: " << j << "(will open 2^j trees): " << j << std::endl;
+    while((!util.criterion) && (depth_ < MAXDEPTH)){
 
-      Tree tree;  
-      int n_prima;
-      int s_prima;
-
-      // Choose a direction. -1 = backwards, 1 = forwards.
-      int v = 2 * (unif01(generator) < 0.5) - 1;
-      
-      std::cout << "Current values:" << std::endl;
-      std::cout << "q+:" << plus_q.t();
-      std::cout << "q-:" << minus_q.t();
-
-      std::cout << "New chosen direction:" << v << std::endl;
-      
-      // Double the size of the tree
-      if(v == -1){    // if backwards
-        tree = BuildTree(minus_q, minus_p, logu, v, j, epsilon, v_n, W, norms_W, 
-                               alpha, beta, generator);
-        minus_q = tree.minus_q;
-        minus_p = tree.minus_p;
-        
-      } else {       // if forwards
-        tree = BuildTree(plus_q,   plus_p, logu, v, j, epsilon, v_n, W, norms_W, 
-                              alpha, beta, generator);
-        plus_q  = tree.plus_q;
-        plus_p  = tree.plus_p;
-      }
-      q_prima = tree.q_prima;
-      n_prima = tree.n;
-      s_prima = tree.s;
-
-      std::cout << "End of trees at level j" << std::endl;
-      std::cout << "q+:" << plus_q.t();
-      std::cout << "q-:" << minus_q.t();
-      std::cout << "n' (valid points in subtrees at level j):" << n_prima << std::endl;
-      std::cout << "s' (stop criteria met in subtrees at level j):" << s_prima << std::endl;
-      std::cout << "q':" << q_prima.t();
+      // // Randomly sample a direction. -1 = backwards, 1 = forwards.
+      util.sign = 2 * (unif01(generator) < 0.5) - 1;
     
-      
-      if(s_prima == 1){ 
+      // Set the variables to update (right or left)
+      // z and rho are pointers to the right/left positions
+      // Build a new subtree in the chosen direction
+      // (Modifies z_propose, z_minus, z_plus)
+      ps_point* z = 0;
+      arma::vec* rho = 0;
+      if(util.sign == -1){    
+      	   z   = &z_minus;
+           //rho = &rho_minus;
+      } else {  
+      	   z   = &z_plus;
+           //rho = &rho_plus;
+      }
+
+      int n_valid_subtree = BuildTree(z, 0, z_propose, util, depth_, epsilon, postparams, generator);
+      ++depth_;  // Increment depth.
+       
+      if(!util.criterion){ 
         // Use Metropolis-Hastings to decide whether or not to move to a
         // point from the half-tree we just generated.
-        std::cout << "prob q' accepted = n'/n = " << n_prima/n;
-        if(unif01(generator) < std::min(1, n_prima/n)){ 
-          current_q = q_prima; // Accept proposal (it will be THE new sample when s=0)
-          std::cout << "--Accepted:" << std::endl;
-        } else {
-          std::cout << "--Rejected: " << std::endl;
+        double subtree_prob = std::min(1, static_cast<double>(n_valid_subtree)/n_valid);
+        if(unif01(generator) < subtree_prob){ 
+          current_q = z_propose->q; // Accept proposal (it will be THE new sample when s=0)
         }
       }
 
       // Update number of valid points we've seen.
-      n += n_prima;
+      n_valid += n_valid_subtree;
 
       // Decide if it's time to stop.
-      arma::vec diff_q = (plus_q - minus_q);
-      s = s_prima && (sum(diff_q % minus_p) >= 0) && (sum(diff_q % plus_p) >= 0);
-
-      // Increment depth.
-      j++; 
+      arma::vec diff_q = (z_plus.q - z_minus.q);
+      util.criterion = util.criterion && (sum(diff_q % z_minus.p) >= 0) && (sum(diff_q % z_plus.q) >= 0);
 
     } // end while
     
@@ -365,8 +279,7 @@ arma::mat sample_nuts_cpp(const arma::ivec v_n, const arma::mat& W, arma::vec h_
     
   } // end for
   h_n_samples = h_n_samples.t();
-  return(h_n_samples);
-  
+  return(exp(h_n_samples));
 }
 
 
@@ -399,7 +312,7 @@ int main(){
   //std::cout << W << std::endl;
 
 
-  float epsilon = 0.00001;
+  float epsilon = 0.0000001;
   int iter = 3;
   arma::mat samples = sample_nuts_cpp(v_n, W, h_n+10, alpha, beta, epsilon, iter);
 
