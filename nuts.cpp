@@ -156,6 +156,8 @@ int BuildTree(pq_point& z, pq_point& z_propose,
               posterior_params& postparams, 
               std::default_random_engine& generator){
 
+  //std::cout << "\n Tree direction:" << util.sign << " Depth:" << depth << std::endl;
+
   int K = z.q.n_rows;
 
   //std::default_random_engine generator;
@@ -177,7 +179,6 @@ int BuildTree(pq_point& z, pq_point& z_propose,
     p_sharp_right = p_sharp_left;
 
     return valid_subtree;
-
   } 
 
   // General recursion
@@ -186,6 +187,7 @@ int BuildTree(pq_point& z, pq_point& z_propose,
   // Build the left subtree
   arma::vec rho_left(K); rho_left.zeros();
   int n1 = BuildTree(z, z_propose, p_sharp_left, p_sharp_dummy, rho_left, util, depth-1, epsilon, postparams, generator);
+
   if (!util.criterion) return 0; // early stopping
 
   // Build the right subtree
@@ -198,14 +200,16 @@ int BuildTree(pq_point& z, pq_point& z_propose,
   double accept_prob = static_cast<double>(n2) / std::max((n1 + n2), 1); // avoids 0/0;
   float rand01 = unif01(generator);
   if(util.criterion && (rand01 < accept_prob)){
-  z_propose = z_propose_right;
-  
+    z_propose = z_propose_right;
+  }
+
   // Break when NUTS criterion is no longer satisfied
   arma::vec rho_subtree = rho_left + rho_right;
   rho += rho_subtree;
   util.criterion = compute_criterion(p_sharp_left, p_sharp_right, rho);
-  return n1 + n2;
-  }
+
+  int n_valid_subtree = n1 + n2;
+  return(n_valid_subtree);
 }
 
 
@@ -223,6 +227,7 @@ arma::mat sample_nuts_cpp(const arma::ivec v_n, const arma::mat& W, arma::vec cu
   std::default_random_engine generator;
   std::uniform_real_distribution<double> unif01(0.0,1.0);
   std::normal_distribution<double> normal(0,1);
+  std::exponential_distribution<double> exp1(1);
 
   //const arma::rowvec norms_W = u_ * W;  
   // Store fixed data and parameters
@@ -249,7 +254,7 @@ arma::mat sample_nuts_cpp(const arma::ivec v_n, const arma::mat& W, arma::vec cu
 
   // Transition
   for(int i=2; i<iter; i++){
-    std::cout << "* Sample: " << i << std::endl;
+    std::cout << "******************* Sample: " << i << std::endl;
 
     nuts_util util;
 
@@ -277,14 +282,13 @@ arma::mat sample_nuts_cpp(const arma::ivec v_n, const arma::mat& W, arma::vec cu
     // Joint logprobability of position q and momentum p
     float joint = loglike_cpp(current_q, postparams) - 0.5* sum(p0 % p0);
 
-    // Sample the slice variable
-    // Resample u ~ uniform([0, exp(joint)]). 
-    // double limit_sup = exp( loglike_cpp(current_q, v_n, W, alpha, beta) - 0.5* sum(p % p));
-    // std::uniform_real_distribution<double> distribution(0.0,limit_sup); Computational issues
-    // Equivalent to (log(u) - joint) ~ exponential(1).
-    //logu = joint - exprnd(1);
-    std::exponential_distribution<double> distribution(1);
-    float random = distribution(generator);
+    // Slice variable
+    ///////////////////////
+    // Sample the slice variable: u ~ uniform([0, exp(joint)]). 
+    // Equivalent to: (log(u) - joint) ~ exponential(1).
+    // logu = joint - exprnd(1);
+    std::exponential_distribution<double> exp1(1);
+    float random = exp1(generator);
     util.log_u = joint - random;
 
     int n_valid = 1;
@@ -299,6 +303,7 @@ arma::mat sample_nuts_cpp(const arma::ivec v_n, const arma::mat& W, arma::vec cu
 
     // Build a balanced binary tree until the NUTS criterion fails
     while(util.criterion && (depth_ < MAXDEPTH)){
+      std::cout << "*****depth : " << depth_  << std::endl;
 
       // Build a new subtree in the chosen direction
       // (Modifies z_propose, z_minus, z_plus)
@@ -307,7 +312,7 @@ arma::mat sample_nuts_cpp(const arma::ivec v_n, const arma::mat& W, arma::vec cu
 
       // Build a new subtree in a random direction
       util.sign = 2 * (unif01(generator) < 0.5) - 1;
-      int n_valid_subtree;
+      int n_valid_subtree=0;
       if(util.sign == 1){    
       	   z.pq_point::operator=(z_minus);
            n_valid_subtree = BuildTree(z, z_propose, p_sharp_dummy, p_sharp_plus, rho_subtree, util, depth_, epsilon, postparams, generator);
@@ -321,10 +326,12 @@ arma::mat sample_nuts_cpp(const arma::ivec v_n, const arma::mat& W, arma::vec cu
       
       ++depth_;  // Increment depth.
        
-      if(!util.criterion){ 
+
+      if(util.criterion){ 
         // Use Metropolis-Hastings to decide whether or not to move to a
         // point from the half-tree we just generated.
         double subtree_prob = std::min(1.0, static_cast<double>(n_valid_subtree)/n_valid);
+
         if(unif01(generator) < subtree_prob){ 
           current_q = z_propose.q; // Accept proposal (it will be THE new sample when s=0)
         }
@@ -335,8 +342,7 @@ arma::mat sample_nuts_cpp(const arma::ivec v_n, const arma::mat& W, arma::vec cu
 
       // Break when NUTS criterion is no longer satisfied
       rho += rho_subtree;
-      util.criterion = util.criterion && !compute_criterion(p_sharp_minus, p_sharp_plus, rho);
-      
+      util.criterion = util.criterion && compute_criterion(p_sharp_minus, p_sharp_plus, rho);
     } // end while
     
 
@@ -367,7 +373,7 @@ int main(){
   const arma::mat W = randu<mat>(F, K);
   arma::ivec v_n(F);
   arma::vec h_n(K);
-  h_n = h_n.ones()*10;
+  h_n = h_n.ones()*5;
 
   for(int f=0; f<F; f++){
     float lambda_f = as_scalar(W.row(f) * h_n);
@@ -381,9 +387,9 @@ int main(){
   //std::cout << W << std::endl;
 
 
-  float epsilon = 0.01;
-  int iter = 100;
-  arma::mat samples = sample_nuts_cpp(v_n, W, h_n+10, alpha, beta, epsilon, iter);
+  float epsilon = 0.0001;
+  int iter = 10000;
+  arma::mat samples = sample_nuts_cpp(v_n, W, h_n+20, alpha, beta, epsilon, iter);
 
   std::cout << "samples of h_n:" << std::endl;
   std::cout << samples << endl;
